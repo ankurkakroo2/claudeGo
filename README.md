@@ -1,6 +1,6 @@
 # ClaudeGo
 
-<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/d26c75de-6f1b-498b-b87a-eb2ff5da3a86" />
+<img width="300" height="300" alt="image" src="https://github.com/user-attachments/assets/d26c75de-6f1b-498b-b87a-eb2ff5da3a86" />
 
 ## Your phone disconnects. Your Claude session dies. Hours of work gone.
 
