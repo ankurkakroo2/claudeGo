@@ -1,0 +1,1363 @@
+#!/usr/bin/env bash
+#
+# ClaudeGo - E2E Claude Code Setup for Remote Machines
+# Use Claude Code reliably from your phone. No more lost sessions.
+#
+# Repository: https://github.com/ankurkakroo2/claudeGo
+# License: MIT
+#
+set -euo pipefail
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+CLAUDEGO_VERSION="1.0.0"
+CLAUDEGO_DIR="${CLAUDEGO_DIR:-$HOME/.claudego}"
+STATE_FILE="$CLAUDEGO_DIR/state"
+LOG_FILE="$CLAUDEGO_DIR/install.log"
+CONFIG_FILE="$CLAUDEGO_DIR/config"
+
+# Minimum RAM before swap is mandatory (in KB)
+MIN_RAM_KB=524288  # 512MB
+
+# Colors (will be disabled if not interactive)
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+# Disable colors if not interactive
+if [[ ! -t 1 ]]; then
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' NC=''
+fi
+
+log() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] $*" >> "$LOG_FILE"
+}
+
+print_header() {
+    echo -e "\n${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}$1${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+}
+
+print_step() {
+    echo -e "${BLUE}▶${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${NC} $1"
+    log "SUCCESS: $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠${NC} $1"
+    log "WARNING: $1"
+}
+
+print_error() {
+    echo -e "${RED}✗${NC} $1"
+    log "ERROR: $1"
+}
+
+print_info() {
+    echo -e "${CYAN}ℹ${NC} $1"
+}
+
+# Prompt user for confirmation
+confirm() {
+    local prompt="${1:-Continue?}"
+    local default="${2:-y}"
+    local response
+
+    if [[ "$default" == "y" ]]; then
+        echo -en "${BOLD}$prompt${NC} [Y/n] "
+    else
+        echo -en "${BOLD}$prompt${NC} [y/N] "
+    fi
+
+    read -r response
+    response=${response:-$default}
+
+    [[ "${response,,}" == "y" || "${response,,}" == "yes" ]]
+}
+
+# Prompt for input with default
+prompt_input() {
+    local prompt="$1"
+    local default="${2:-}"
+    local response
+
+    if [[ -n "$default" ]]; then
+        echo -en "${BOLD}$prompt${NC} [$default]: "
+    else
+        echo -en "${BOLD}$prompt${NC}: "
+    fi
+
+    read -r response
+    echo "${response:-$default}"
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -eq 0 ]]; then
+        print_error "Do not run this script as root. Run as your regular user."
+        print_info "The script will use sudo when needed."
+        exit 1
+    fi
+}
+
+# Check if sudo is available
+check_sudo() {
+    if ! command -v sudo &>/dev/null; then
+        print_error "sudo is required but not installed."
+        exit 1
+    fi
+
+    # Test sudo access
+    if ! sudo -n true 2>/dev/null; then
+        print_info "This script requires sudo access for some operations."
+        print_info "You may be prompted for your password."
+        echo
+        if ! sudo true; then
+            print_error "Failed to obtain sudo access."
+            exit 1
+        fi
+    fi
+}
+
+# =============================================================================
+# STATE MANAGEMENT (Resume Capability)
+# =============================================================================
+
+init_state() {
+    mkdir -p "$CLAUDEGO_DIR"
+    touch "$LOG_FILE"
+
+    if [[ ! -f "$STATE_FILE" ]]; then
+        cat > "$STATE_FILE" << 'EOF'
+# ClaudeGo Installation State
+# This file tracks installation progress for resume capability
+STEP_SYSTEM_CHECK=pending
+STEP_SWAP_SETUP=pending
+STEP_PACKAGES_INSTALL=pending
+STEP_NODE_INSTALL=pending
+STEP_MOSH_SETUP=pending
+STEP_FIREWALL_SETUP=pending
+STEP_TMUX_CONFIG=pending
+STEP_CLAUDE_INSTALL=pending
+STEP_ALIASES_SETUP=pending
+STEP_VALIDATION=pending
+INSTALL_STARTED=
+INSTALL_COMPLETED=
+EOF
+        log "Initialized new state file"
+    fi
+}
+
+load_state() {
+    if [[ -f "$STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$STATE_FILE"
+    fi
+}
+
+save_state() {
+    local key="$1"
+    local value="$2"
+
+    if grep -q "^${key}=" "$STATE_FILE" 2>/dev/null; then
+        sed -i "s/^${key}=.*/${key}=${value}/" "$STATE_FILE"
+    else
+        echo "${key}=${value}" >> "$STATE_FILE"
+    fi
+    log "State updated: $key=$value"
+}
+
+is_step_done() {
+    local step="$1"
+    load_state
+    local var="STEP_${step}"
+    [[ "${!var:-pending}" == "done" ]]
+}
+
+mark_step_done() {
+    local step="$1"
+    save_state "STEP_${step}" "done"
+    print_success "Step completed: $step"
+}
+
+mark_step_skipped() {
+    local step="$1"
+    save_state "STEP_${step}" "skipped"
+    print_info "Step skipped: $step"
+}
+
+# =============================================================================
+# SYSTEM DETECTION
+# =============================================================================
+
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck source=/dev/null
+        source /etc/os-release
+        OS_NAME="$NAME"
+        OS_VERSION="$VERSION_ID"
+        OS_ID="$ID"
+    elif [[ -f /etc/debian_version ]]; then
+        OS_NAME="Debian"
+        OS_VERSION=$(cat /etc/debian_version)
+        OS_ID="debian"
+    else
+        OS_NAME="Unknown"
+        OS_VERSION="Unknown"
+        OS_ID="unknown"
+    fi
+
+    log "Detected OS: $OS_NAME $OS_VERSION ($OS_ID)"
+}
+
+detect_package_manager() {
+    if command -v apt-get &>/dev/null; then
+        PKG_MANAGER="apt"
+        PKG_INSTALL="sudo apt-get install -y"
+        PKG_UPDATE="sudo apt-get update"
+    elif command -v dnf &>/dev/null; then
+        PKG_MANAGER="dnf"
+        PKG_INSTALL="sudo dnf install -y"
+        PKG_UPDATE="sudo dnf check-update || true"
+    elif command -v yum &>/dev/null; then
+        PKG_MANAGER="yum"
+        PKG_INSTALL="sudo yum install -y"
+        PKG_UPDATE="sudo yum check-update || true"
+    elif command -v pacman &>/dev/null; then
+        PKG_MANAGER="pacman"
+        PKG_INSTALL="sudo pacman -S --noconfirm"
+        PKG_UPDATE="sudo pacman -Sy"
+    else
+        PKG_MANAGER="unknown"
+        print_error "No supported package manager found (apt, dnf, yum, pacman)"
+        exit 1
+    fi
+
+    log "Detected package manager: $PKG_MANAGER"
+}
+
+get_total_ram_kb() {
+    awk '/MemTotal/ {print $2}' /proc/meminfo
+}
+
+get_total_ram_mb() {
+    local ram_kb
+    ram_kb=$(get_total_ram_kb)
+    echo $((ram_kb / 1024))
+}
+
+get_swap_size_kb() {
+    awk '/SwapTotal/ {print $2}' /proc/meminfo
+}
+
+# =============================================================================
+# STEP 1: SYSTEM CHECK
+# =============================================================================
+
+step_system_check() {
+    if is_step_done "SYSTEM_CHECK"; then
+        print_info "System check already completed. Skipping."
+        return 0
+    fi
+
+    print_header "Step 1: System Check"
+
+    detect_os
+    detect_package_manager
+
+    local ram_mb
+    ram_mb=$(get_total_ram_mb)
+    local ram_kb
+    ram_kb=$(get_total_ram_kb)
+
+    echo -e "  ${BOLD}Operating System:${NC}  $OS_NAME $OS_VERSION"
+    echo -e "  ${BOLD}Package Manager:${NC}   $PKG_MANAGER"
+    echo -e "  ${BOLD}Total RAM:${NC}         ${ram_mb} MB"
+    echo -e "  ${BOLD}Architecture:${NC}      $(uname -m)"
+    echo -e "  ${BOLD}Kernel:${NC}            $(uname -r)"
+    echo
+
+    # Check minimum requirements
+    local warnings=0
+
+    if [[ $ram_kb -lt $MIN_RAM_KB ]]; then
+        print_warning "Low RAM detected (${ram_mb}MB). Swap memory is MANDATORY."
+        print_info "Without swap, your sessions WILL be killed by OOM (Out of Memory)."
+        ((warnings++))
+        save_state "SWAP_MANDATORY" "true"
+    else
+        save_state "SWAP_MANDATORY" "false"
+    fi
+
+    # Check if swap exists
+    local swap_kb
+    swap_kb=$(get_swap_size_kb)
+    if [[ $swap_kb -eq 0 ]]; then
+        echo -e "  ${BOLD}Swap:${NC}              ${RED}Not configured${NC}"
+        if [[ $ram_kb -lt $MIN_RAM_KB ]]; then
+            print_error "No swap on a low-RAM system. This MUST be fixed."
+        else
+            print_warning "No swap configured. Recommended for stability."
+        fi
+    else
+        echo -e "  ${BOLD}Swap:${NC}              $((swap_kb / 1024)) MB"
+        print_success "Swap is configured."
+    fi
+
+    echo
+
+    # Save system info
+    save_state "OS_ID" "$OS_ID"
+    save_state "OS_NAME" "$OS_NAME"
+    save_state "PKG_MANAGER" "$PKG_MANAGER"
+    save_state "RAM_MB" "$ram_mb"
+
+    mark_step_done "SYSTEM_CHECK"
+}
+
+# =============================================================================
+# STEP 2: SWAP SETUP
+# =============================================================================
+
+step_swap_setup() {
+    if is_step_done "SWAP_SETUP"; then
+        print_info "Swap setup already completed. Skipping."
+        return 0
+    fi
+
+    print_header "Step 2: Swap Memory Setup"
+
+    local swap_kb
+    swap_kb=$(get_swap_size_kb)
+
+    if [[ $swap_kb -gt 0 ]]; then
+        print_success "Swap is already configured ($((swap_kb / 1024)) MB)."
+        mark_step_done "SWAP_SETUP"
+        return 0
+    fi
+
+    local ram_mb
+    ram_mb=$(get_total_ram_mb)
+
+    print_info "Swap memory prevents the OOM (Out of Memory) killer from"
+    print_info "terminating your tmux sessions when RAM runs low."
+    echo
+
+    load_state
+    if [[ "${SWAP_MANDATORY:-false}" == "true" ]]; then
+        print_warning "Your system has only ${ram_mb}MB RAM."
+        print_warning "Swap is MANDATORY for reliable Claude Code usage."
+        echo
+    fi
+
+    # Calculate recommended swap size
+    local recommended_swap
+    if [[ $ram_mb -lt 512 ]]; then
+        recommended_swap=2048
+    elif [[ $ram_mb -lt 1024 ]]; then
+        recommended_swap=2048
+    else
+        recommended_swap=$ram_mb
+    fi
+
+    print_info "Recommended swap size: ${recommended_swap}MB"
+    echo
+
+    if ! confirm "Set up ${recommended_swap}MB swap?"; then
+        local custom_swap
+        custom_swap=$(prompt_input "Enter swap size in MB" "$recommended_swap")
+        recommended_swap="$custom_swap"
+    fi
+
+    echo
+    print_step "Creating ${recommended_swap}MB swap file..."
+
+    local swapfile="/swapfile"
+
+    # Check if swapfile already exists
+    if [[ -f "$swapfile" ]]; then
+        print_warning "Swapfile already exists at $swapfile"
+        if confirm "Remove and recreate?"; then
+            sudo swapoff "$swapfile" 2>/dev/null || true
+            sudo rm -f "$swapfile"
+        else
+            mark_step_skipped "SWAP_SETUP"
+            return 0
+        fi
+    fi
+
+    # Create swap file
+    sudo fallocate -l "${recommended_swap}M" "$swapfile" 2>/dev/null || \
+        sudo dd if=/dev/zero of="$swapfile" bs=1M count="$recommended_swap" status=progress
+
+    sudo chmod 600 "$swapfile"
+    sudo mkswap "$swapfile"
+    sudo swapon "$swapfile"
+
+    # Make persistent
+    if ! grep -q "$swapfile" /etc/fstab; then
+        echo "$swapfile none swap sw 0 0" | sudo tee -a /etc/fstab > /dev/null
+        print_success "Swap added to /etc/fstab (persistent across reboots)"
+    fi
+
+    # Verify
+    echo
+    print_step "Verifying swap..."
+    swapon --show
+    echo
+    free -h
+    echo
+
+    print_success "Swap configured successfully!"
+    mark_step_done "SWAP_SETUP"
+}
+
+# =============================================================================
+# STEP 3: INSTALL PACKAGES
+# =============================================================================
+
+step_packages_install() {
+    if is_step_done "PACKAGES_INSTALL"; then
+        print_info "Package installation already completed. Skipping."
+        return 0
+    fi
+
+    print_header "Step 3: Install Required Packages"
+
+    print_info "The following packages will be installed:"
+    echo "  - tmux (terminal multiplexer - keeps sessions alive)"
+    echo "  - mosh (mobile shell - survives network changes)"
+    echo "  - curl (for downloading)"
+    echo "  - git (version control)"
+    echo
+
+    if ! confirm "Install these packages?"; then
+        print_warning "Skipping package installation."
+        print_warning "You may need to install them manually."
+        mark_step_skipped "PACKAGES_INSTALL"
+        return 0
+    fi
+
+    echo
+    print_step "Updating package lists..."
+    $PKG_UPDATE
+
+    echo
+    print_step "Installing packages..."
+    $PKG_INSTALL tmux mosh curl git
+
+    # Verify installations
+    echo
+    local all_installed=true
+
+    for pkg in tmux mosh curl git; do
+        if command -v "$pkg" &>/dev/null; then
+            print_success "$pkg installed: $(command -v "$pkg")"
+        else
+            print_error "$pkg not found after installation"
+            all_installed=false
+        fi
+    done
+
+    if [[ "$all_installed" == "true" ]]; then
+        mark_step_done "PACKAGES_INSTALL"
+    else
+        print_error "Some packages failed to install. Please install them manually."
+        return 1
+    fi
+}
+
+# =============================================================================
+# STEP 4: NODE.JS INSTALLATION
+# =============================================================================
+
+step_node_install() {
+    if is_step_done "NODE_INSTALL"; then
+        print_info "Node.js installation already completed. Skipping."
+        return 0
+    fi
+
+    print_header "Step 4: Node.js Installation"
+
+    # Check if Node.js is already installed
+    if command -v node &>/dev/null; then
+        local node_version
+        node_version=$(node --version)
+        print_success "Node.js is already installed: $node_version"
+
+        # Check if version is recent enough (v18+)
+        local major_version
+        major_version=$(echo "$node_version" | sed 's/v//' | cut -d. -f1)
+
+        if [[ $major_version -lt 18 ]]; then
+            print_warning "Node.js version is older than v18."
+            print_info "Claude Code works best with Node.js v18 or later."
+            if ! confirm "Update Node.js to latest LTS?"; then
+                mark_step_done "NODE_INSTALL"
+                return 0
+            fi
+        else
+            mark_step_done "NODE_INSTALL"
+            return 0
+        fi
+    fi
+
+    print_info "Node.js is required for Claude Code."
+    print_info "We'll install the latest LTS version using NodeSource."
+    echo
+
+    if ! confirm "Install Node.js LTS?"; then
+        print_warning "Skipping Node.js installation."
+        print_warning "You'll need to install it manually before using Claude Code."
+        mark_step_skipped "NODE_INSTALL"
+        return 0
+    fi
+
+    echo
+    print_step "Installing Node.js LTS..."
+
+    case "$PKG_MANAGER" in
+        apt)
+            # NodeSource setup for Debian/Ubuntu
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+            ;;
+        dnf|yum)
+            # NodeSource setup for RHEL/Fedora
+            curl -fsSL https://rpm.nodesource.com/setup_lts.x | sudo bash -
+            sudo $PKG_MANAGER install -y nodejs
+            ;;
+        pacman)
+            sudo pacman -S --noconfirm nodejs npm
+            ;;
+    esac
+
+    # Verify installation
+    echo
+    if command -v node &>/dev/null; then
+        print_success "Node.js installed: $(node --version)"
+        print_success "npm installed: $(npm --version)"
+        mark_step_done "NODE_INSTALL"
+    else
+        print_error "Node.js installation failed."
+        return 1
+    fi
+}
+
+# =============================================================================
+# STEP 5: MOSH SETUP
+# =============================================================================
+
+step_mosh_setup() {
+    if is_step_done "MOSH_SETUP"; then
+        print_info "Mosh setup already completed. Skipping."
+        return 0
+    fi
+
+    print_header "Step 5: Mosh Configuration"
+
+    print_info "Mosh (Mobile Shell) is crucial for mobile connections."
+    print_info "Unlike SSH, mosh survives:"
+    echo "  - Network changes (WiFi to cellular)"
+    echo "  - Connection drops"
+    echo "  - IP address changes"
+    echo "  - Phone going to sleep"
+    echo
+
+    # Check if mosh is installed
+    if ! command -v mosh-server &>/dev/null; then
+        print_error "mosh-server not found. Installing..."
+        $PKG_INSTALL mosh
+    fi
+
+    # Verify mosh-server location
+    local mosh_path
+    mosh_path=$(which mosh-server)
+    print_success "mosh-server found at: $mosh_path"
+
+    # Test mosh-server can run
+    print_step "Testing mosh-server..."
+    if mosh-server new -s -c 256 -l LANG=en_US.UTF-8 2>&1 | head -1 | grep -q "MOSH CONNECT"; then
+        print_success "mosh-server is working correctly"
+    else
+        print_warning "mosh-server test returned unexpected output"
+    fi
+
+    echo
+    print_success "Mosh is ready!"
+    print_info "Mosh uses UDP ports 60000-61000 (we'll configure firewall next)"
+
+    mark_step_done "MOSH_SETUP"
+}
+
+# =============================================================================
+# STEP 6: FIREWALL SETUP
+# =============================================================================
+
+step_firewall_setup() {
+    if is_step_done "FIREWALL_SETUP"; then
+        print_info "Firewall setup already completed. Skipping."
+        return 0
+    fi
+
+    print_header "Step 6: Firewall Configuration"
+
+    # Check if UFW is available
+    if ! command -v ufw &>/dev/null; then
+        print_info "UFW not found. Firewall configuration skipped."
+        print_warning "If you have a different firewall, ensure these ports are open:"
+        echo "  - TCP 22 (SSH)"
+        echo "  - UDP 60000-61000 (Mosh)"
+        mark_step_skipped "FIREWALL_SETUP"
+        return 0
+    fi
+
+    # Check if UFW is active
+    local ufw_status
+    ufw_status=$(sudo ufw status | head -1)
+
+    print_info "Current firewall status: $ufw_status"
+    echo
+
+    print_info "Required ports:"
+    echo "  - TCP 22 (SSH - initial connection)"
+    echo "  - UDP 60000-61000 (Mosh - session persistence)"
+    echo
+
+    if ! confirm "Configure firewall rules?"; then
+        print_warning "Skipping firewall configuration."
+        print_warning "Ensure ports 22/tcp and 60000-61000/udp are open!"
+        mark_step_skipped "FIREWALL_SETUP"
+        return 0
+    fi
+
+    echo
+    print_step "Allowing SSH (port 22)..."
+    sudo ufw allow 22/tcp
+
+    print_step "Allowing Mosh (ports 60000-61000/udp)..."
+    sudo ufw allow 60000:61000/udp
+
+    # Enable UFW if not active
+    if [[ "$ufw_status" == *"inactive"* ]]; then
+        echo
+        print_warning "UFW is currently inactive."
+        print_warning "Enabling UFW without proper SSH rules can lock you out!"
+        echo
+        if confirm "Enable UFW now? (SSH rule has been added)"; then
+            sudo ufw --force enable
+            print_success "UFW enabled"
+        else
+            print_info "UFW left inactive. Enable it manually with: sudo ufw enable"
+        fi
+    fi
+
+    echo
+    print_step "Current firewall rules:"
+    sudo ufw status numbered
+
+    echo
+    print_success "Firewall configured!"
+    mark_step_done "FIREWALL_SETUP"
+}
+
+# =============================================================================
+# STEP 7: TMUX CONFIGURATION
+# =============================================================================
+
+step_tmux_config() {
+    if is_step_done "TMUX_CONFIG"; then
+        print_info "Tmux configuration already completed. Skipping."
+        return 0
+    fi
+
+    print_header "Step 7: Tmux Configuration"
+
+    print_info "Tmux keeps your sessions alive even when you disconnect."
+    print_info "We'll configure it for optimal mobile usage:"
+    echo "  - Safe wrapper to avoid systemd scope issues"
+    echo "  - Extended history for scrollback"
+    echo "  - Mouse support (if your terminal supports it)"
+    echo
+
+    if ! confirm "Configure tmux for mobile use?"; then
+        mark_step_skipped "TMUX_CONFIG"
+        return 0
+    fi
+
+    # Create tmux.conf
+    local tmux_conf="$HOME/.tmux.conf"
+
+    print_step "Creating tmux configuration..."
+
+    cat > "$tmux_conf" << 'TMUX_CONF'
+# ClaudeGo Tmux Configuration
+# Optimized for mobile/remote sessions
+
+# Don't destroy session when last client detaches
+set -g destroy-unattached off
+
+# Don't exit if session is empty
+set -g exit-empty off
+
+# Extended history
+set -g history-limit 100000
+
+# Aggressive resize (good for mobile screens)
+setw -g aggressive-resize on
+
+# Enable mouse support
+set -g mouse on
+
+# Don't rename windows automatically
+set -g allow-rename off
+setw -g automatic-rename off
+
+# Start windows and panes at 1, not 0
+set -g base-index 1
+setw -g pane-base-index 1
+
+# Reduce escape time (important for vim users)
+set -sg escape-time 10
+
+# Use 256 colors
+set -g default-terminal "screen-256color"
+
+# Status bar
+set -g status-position bottom
+set -g status-style 'bg=colour234 fg=colour137'
+set -g status-left '#[fg=colour233,bg=colour245,bold] #S '
+set -g status-right '#[fg=colour233,bg=colour245,bold] %H:%M '
+
+# Reload config with prefix + r
+bind r source-file ~/.tmux.conf \; display "Config reloaded!"
+TMUX_CONF
+
+    print_success "Created $tmux_conf"
+
+    # Create safe tmux wrapper in bashrc
+    print_step "Creating safe tmux wrapper..."
+
+    local bashrc="$HOME/.bashrc"
+    local wrapper_marker="# ClaudeGo tmux wrapper"
+
+    # Remove old wrapper if exists
+    if grep -q "$wrapper_marker" "$bashrc" 2>/dev/null; then
+        sed -i "/$wrapper_marker/,/^# End ClaudeGo/d" "$bashrc"
+    fi
+
+    cat >> "$bashrc" << 'TMUX_WRAPPER'
+
+# ClaudeGo tmux wrapper
+# This wrapper prevents systemd scope issues that can kill tmux sessions
+tmux() {
+    command env -u DBUS_SESSION_BUS_ADDRESS -u XDG_RUNTIME_DIR /usr/bin/tmux "$@"
+}
+# End ClaudeGo tmux wrapper
+TMUX_WRAPPER
+
+    print_success "Safe tmux wrapper added to $bashrc"
+
+    # Enable user lingering if systemd is available
+    if command -v loginctl &>/dev/null; then
+        print_step "Enabling user lingering for session persistence..."
+        sudo loginctl enable-linger "$USER" 2>/dev/null || true
+
+        local linger_status
+        linger_status=$(loginctl show-user "$USER" -p Linger 2>/dev/null || echo "Linger=no")
+        if [[ "$linger_status" == *"yes"* ]]; then
+            print_success "User lingering enabled"
+        else
+            print_warning "Could not enable user lingering (non-critical)"
+        fi
+    fi
+
+    echo
+    print_success "Tmux configured for reliable mobile usage!"
+    mark_step_done "TMUX_CONFIG"
+}
+
+# =============================================================================
+# STEP 8: CLAUDE CODE INSTALLATION
+# =============================================================================
+
+step_claude_install() {
+    if is_step_done "CLAUDE_INSTALL"; then
+        print_info "Claude Code installation already completed. Skipping."
+        return 0
+    fi
+
+    print_header "Step 8: Claude Code Installation"
+
+    # Check if Node.js is available
+    if ! command -v npm &>/dev/null; then
+        print_error "npm not found. Please install Node.js first."
+        return 1
+    fi
+
+    # Check if claude is already installed
+    if command -v claude &>/dev/null; then
+        local claude_version
+        claude_version=$(claude --version 2>/dev/null || echo "unknown")
+        print_success "Claude Code is already installed: $claude_version"
+
+        if ! confirm "Reinstall/update Claude Code?"; then
+            mark_step_done "CLAUDE_INSTALL"
+            return 0
+        fi
+    fi
+
+    print_info "Installing Claude Code via npm..."
+    echo
+
+    if ! confirm "Install Claude Code globally?"; then
+        mark_step_skipped "CLAUDE_INSTALL"
+        return 0
+    fi
+
+    echo
+    print_step "Installing @anthropic-ai/claude-code..."
+
+    npm install -g @anthropic-ai/claude-code
+
+    # Verify installation
+    echo
+    if command -v claude &>/dev/null; then
+        print_success "Claude Code installed successfully!"
+        claude --version
+    else
+        # Check if npm global bin is in PATH
+        local npm_bin
+        npm_bin=$(npm config get prefix)/bin
+
+        if [[ -f "$npm_bin/claude" ]]; then
+            print_warning "Claude installed but not in PATH."
+            print_info "Add this to your ~/.bashrc:"
+            echo "  export PATH=\"\$PATH:$npm_bin\""
+
+            # Auto-add to bashrc
+            if ! grep -q "$npm_bin" "$HOME/.bashrc" 2>/dev/null; then
+                echo "export PATH=\"\$PATH:$npm_bin\"" >> "$HOME/.bashrc"
+                print_success "Added npm bin to PATH in ~/.bashrc"
+            fi
+        else
+            print_error "Claude Code installation failed."
+            return 1
+        fi
+    fi
+
+    mark_step_done "CLAUDE_INSTALL"
+}
+
+# =============================================================================
+# STEP 9: ALIASES AND HELPERS
+# =============================================================================
+
+step_aliases_setup() {
+    if is_step_done "ALIASES_SETUP"; then
+        print_info "Aliases setup already completed. Skipping."
+        return 0
+    fi
+
+    print_header "Step 9: Shell Aliases & Helpers"
+
+    print_info "We'll create helpful aliases and scripts for daily use:"
+    echo "  - cg         : Start/attach to Claude session"
+    echo "  - cg-new     : Force create a new session"
+    echo "  - cg-list    : List all sessions"
+    echo "  - cg-kill    : Kill Claude session"
+    echo "  - cg-status  : Show system status"
+    echo
+
+    if ! confirm "Install ClaudeGo aliases?"; then
+        mark_step_skipped "ALIASES_SETUP"
+        return 0
+    fi
+
+    local bashrc="$HOME/.bashrc"
+    local alias_marker="# ClaudeGo aliases"
+
+    # Remove old aliases if exists
+    if grep -q "$alias_marker" "$bashrc" 2>/dev/null; then
+        sed -i "/$alias_marker/,/^# End ClaudeGo aliases/d" "$bashrc"
+    fi
+
+    cat >> "$bashrc" << 'ALIASES'
+
+# ClaudeGo aliases
+# Quick commands for Claude Code with tmux
+
+# Session name
+export CLAUDEGO_SESSION="${CLAUDEGO_SESSION:-claude}"
+
+# Start or attach to Claude session
+cg() {
+    if tmux has-session -t "$CLAUDEGO_SESSION" 2>/dev/null; then
+        echo "Attaching to existing session: $CLAUDEGO_SESSION"
+        tmux attach -t "$CLAUDEGO_SESSION"
+    else
+        echo "Creating new session: $CLAUDEGO_SESSION"
+        tmux new-session -d -s "$CLAUDEGO_SESSION"
+        tmux send-keys -t "$CLAUDEGO_SESSION" 'claude' Enter
+        tmux attach -t "$CLAUDEGO_SESSION"
+    fi
+}
+
+# Force create new session (kills existing)
+cg-new() {
+    if tmux has-session -t "$CLAUDEGO_SESSION" 2>/dev/null; then
+        echo "Killing existing session..."
+        tmux kill-session -t "$CLAUDEGO_SESSION"
+    fi
+    echo "Creating new session: $CLAUDEGO_SESSION"
+    tmux new-session -d -s "$CLAUDEGO_SESSION"
+    tmux send-keys -t "$CLAUDEGO_SESSION" 'claude' Enter
+    tmux attach -t "$CLAUDEGO_SESSION"
+}
+
+# List all tmux sessions
+cg-list() {
+    echo "Active tmux sessions:"
+    tmux ls 2>/dev/null || echo "No sessions running"
+}
+
+# Kill Claude session
+cg-kill() {
+    if tmux has-session -t "$CLAUDEGO_SESSION" 2>/dev/null; then
+        tmux kill-session -t "$CLAUDEGO_SESSION"
+        echo "Session '$CLAUDEGO_SESSION' killed"
+    else
+        echo "No session named '$CLAUDEGO_SESSION' found"
+    fi
+}
+
+# Show system status
+cg-status() {
+    echo "=== ClaudeGo Status ==="
+    echo
+    echo "Memory:"
+    free -h
+    echo
+    echo "Swap:"
+    swapon --show 2>/dev/null || echo "No swap configured"
+    echo
+    echo "Tmux sessions:"
+    tmux ls 2>/dev/null || echo "No sessions running"
+    echo
+    echo "Mosh:"
+    if pgrep -x mosh-server > /dev/null; then
+        echo "mosh-server is running"
+    else
+        echo "No active mosh connections"
+    fi
+}
+
+# Quick detach reminder
+cg-help() {
+    cat << 'HELP'
+ClaudeGo Quick Reference
+========================
+
+Commands:
+  cg          Start/attach to Claude session
+  cg-new      Force create new session (kills existing)
+  cg-list     List all tmux sessions
+  cg-kill     Kill Claude session
+  cg-status   Show system status
+
+Tmux shortcuts (inside session):
+  Ctrl+b d    Detach from session (session keeps running)
+  Ctrl+b [    Scroll mode (q to exit)
+  Ctrl+b c    Create new window
+  Ctrl+b n/p  Next/previous window
+
+Tips:
+  - Always detach (Ctrl+b d) before closing your terminal app
+  - Sessions survive disconnections when using mosh
+  - Run 'cg-status' to check system health
+HELP
+}
+# End ClaudeGo aliases
+ALIASES
+
+    print_success "Aliases added to $bashrc"
+
+    echo
+    print_info "Run 'source ~/.bashrc' or reconnect to use the new aliases."
+
+    mark_step_done "ALIASES_SETUP"
+}
+
+# =============================================================================
+# STEP 10: VALIDATION
+# =============================================================================
+
+step_validation() {
+    if is_step_done "VALIDATION"; then
+        print_info "Validation already completed. Skipping."
+        return 0
+    fi
+
+    print_header "Step 10: Validation"
+
+    print_info "Running validation checks..."
+    echo
+
+    local all_passed=true
+
+    # Check swap
+    print_step "Checking swap..."
+    local swap_kb
+    swap_kb=$(get_swap_size_kb)
+    if [[ $swap_kb -gt 0 ]]; then
+        print_success "Swap configured: $((swap_kb / 1024)) MB"
+    else
+        print_warning "No swap configured (may cause OOM issues)"
+        all_passed=false
+    fi
+
+    # Check mosh
+    print_step "Checking mosh..."
+    if command -v mosh-server &>/dev/null; then
+        print_success "mosh-server available"
+    else
+        print_warning "mosh-server not found"
+        all_passed=false
+    fi
+
+    # Check tmux
+    print_step "Checking tmux..."
+    if command -v tmux &>/dev/null; then
+        print_success "tmux available: $(tmux -V)"
+    else
+        print_error "tmux not found"
+        all_passed=false
+    fi
+
+    # Check Node.js
+    print_step "Checking Node.js..."
+    if command -v node &>/dev/null; then
+        print_success "Node.js available: $(node --version)"
+    else
+        print_warning "Node.js not found"
+        all_passed=false
+    fi
+
+    # Check Claude
+    print_step "Checking Claude Code..."
+    if command -v claude &>/dev/null; then
+        print_success "Claude Code available"
+    else
+        # Check npm global bin
+        local npm_bin
+        npm_bin=$(npm config get prefix 2>/dev/null)/bin
+        if [[ -f "$npm_bin/claude" ]]; then
+            print_warning "Claude installed at $npm_bin/claude but not in PATH"
+            print_info "Run: source ~/.bashrc"
+        else
+            print_warning "Claude Code not found"
+            all_passed=false
+        fi
+    fi
+
+    # Check firewall
+    print_step "Checking firewall..."
+    if command -v ufw &>/dev/null; then
+        if sudo ufw status | grep -q "22/tcp\|22 "; then
+            print_success "SSH port open"
+        else
+            print_warning "SSH port may not be open"
+        fi
+
+        if sudo ufw status | grep -q "60000:61000/udp\|60000"; then
+            print_success "Mosh ports open"
+        else
+            print_warning "Mosh ports may not be open"
+        fi
+    else
+        print_info "UFW not available - verify firewall manually"
+    fi
+
+    # Check user lingering
+    print_step "Checking user lingering..."
+    if command -v loginctl &>/dev/null; then
+        local linger
+        linger=$(loginctl show-user "$USER" -p Linger 2>/dev/null | cut -d= -f2)
+        if [[ "$linger" == "yes" ]]; then
+            print_success "User lingering enabled"
+        else
+            print_warning "User lingering not enabled"
+        fi
+    fi
+
+    echo
+
+    if [[ "$all_passed" == "true" ]]; then
+        print_success "All validation checks passed!"
+    else
+        print_warning "Some checks had warnings. Review the output above."
+    fi
+
+    mark_step_done "VALIDATION"
+}
+
+# =============================================================================
+# AUTHENTICATION FLOW
+# =============================================================================
+
+run_authentication() {
+    print_header "Claude Code Authentication"
+
+    print_info "Claude Code requires authentication with your Anthropic account."
+    print_info "You'll need to log in via your browser."
+    echo
+
+    if ! confirm "Start authentication now?"; then
+        print_info "You can authenticate later by running: claude"
+        return 0
+    fi
+
+    echo
+    print_info "Starting Claude Code authentication..."
+    print_info "Follow the prompts in your browser."
+    echo
+
+    # Source bashrc to get updated PATH
+    # shellcheck source=/dev/null
+    source "$HOME/.bashrc" 2>/dev/null || true
+
+    # Try to run claude login or just claude to trigger auth
+    if command -v claude &>/dev/null; then
+        claude --help 2>/dev/null || true
+        echo
+        print_info "If authentication didn't complete, run 'claude' to continue."
+    else
+        local npm_bin
+        npm_bin=$(npm config get prefix 2>/dev/null)/bin
+        if [[ -f "$npm_bin/claude" ]]; then
+            "$npm_bin/claude" --help 2>/dev/null || true
+        fi
+    fi
+}
+
+# =============================================================================
+# SHOW COMPLETION MESSAGE
+# =============================================================================
+
+show_completion() {
+    print_header "Installation Complete!"
+
+    echo -e "${GREEN}"
+    cat << 'BANNER'
+   _____ _                 _       _____
+  / ____| |               | |     / ____|
+ | |    | | __ _ _   _  __| | ___| |  __  ___
+ | |    | |/ _` | | | |/ _` |/ _ \ | |_ |/ _ \
+ | |____| | (_| | |_| | (_| |  __/ |__| | (_) |
+  \_____|_|\__,_|\__,_|\__,_|\___|\_____|\___/
+
+BANNER
+    echo -e "${NC}"
+
+    echo -e "${BOLD}Your server is now set up for reliable Claude Code usage!${NC}"
+    echo
+    echo -e "${CYAN}Quick Start:${NC}"
+    echo "  1. Reload your shell: ${BOLD}source ~/.bashrc${NC}"
+    echo "  2. Start Claude:      ${BOLD}cg${NC}"
+    echo
+    echo -e "${CYAN}From Termius (or any SSH client):${NC}"
+    echo "  1. Enable 'Use Mosh' in connection settings"
+    echo "  2. Connect to your server"
+    echo "  3. Run: ${BOLD}cg${NC}"
+    echo "  4. Detach anytime with: ${BOLD}Ctrl+b d${NC}"
+    echo
+    echo -e "${CYAN}Key Points:${NC}"
+    echo "  - Your session survives disconnections (via mosh)"
+    echo "  - Swap memory prevents OOM kills"
+    echo "  - Use ${BOLD}cg-status${NC} to check system health"
+    echo "  - Use ${BOLD}cg-help${NC} for quick reference"
+    echo
+    echo -e "${CYAN}Log file:${NC} $LOG_FILE"
+    echo -e "${CYAN}State file:${NC} $STATE_FILE"
+    echo
+
+    save_state "INSTALL_COMPLETED" "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+
+# =============================================================================
+# SHOW RESUME INFO
+# =============================================================================
+
+show_resume_info() {
+    load_state
+
+    if [[ -z "${INSTALL_STARTED:-}" ]]; then
+        return
+    fi
+
+    print_info "Previous installation detected."
+    echo
+    echo "  Started: ${INSTALL_STARTED:-unknown}"
+    echo "  Status:"
+
+    local steps=(
+        "SYSTEM_CHECK:System Check"
+        "SWAP_SETUP:Swap Setup"
+        "PACKAGES_INSTALL:Package Installation"
+        "NODE_INSTALL:Node.js Installation"
+        "MOSH_SETUP:Mosh Configuration"
+        "FIREWALL_SETUP:Firewall Setup"
+        "TMUX_CONFIG:Tmux Configuration"
+        "CLAUDE_INSTALL:Claude Installation"
+        "ALIASES_SETUP:Aliases Setup"
+        "VALIDATION:Validation"
+    )
+
+    for step_info in "${steps[@]}"; do
+        local step="${step_info%%:*}"
+        local name="${step_info#*:}"
+        local var="STEP_${step}"
+        local status="${!var:-pending}"
+
+        case "$status" in
+            done)
+                echo -e "    ${GREEN}✓${NC} $name"
+                ;;
+            skipped)
+                echo -e "    ${YELLOW}○${NC} $name (skipped)"
+                ;;
+            *)
+                echo -e "    ${BLUE}◦${NC} $name (pending)"
+                ;;
+        esac
+    done
+
+    echo
+}
+
+# =============================================================================
+# MAIN MENU
+# =============================================================================
+
+show_menu() {
+    echo
+    echo -e "${BOLD}What would you like to do?${NC}"
+    echo "  1) Continue/restart installation"
+    echo "  2) Reset and start fresh"
+    echo "  3) Run validation only"
+    echo "  4) Show status"
+    echo "  5) Exit"
+    echo
+
+    local choice
+    choice=$(prompt_input "Choice" "1")
+
+    case "$choice" in
+        1)
+            return 0
+            ;;
+        2)
+            if confirm "This will reset all progress. Are you sure?"; then
+                rm -f "$STATE_FILE"
+                init_state
+                print_success "State reset. Starting fresh."
+            fi
+            return 0
+            ;;
+        3)
+            step_validation
+            exit 0
+            ;;
+        4)
+            show_resume_info
+            exit 0
+            ;;
+        5)
+            exit 0
+            ;;
+        *)
+            print_error "Invalid choice"
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# MAIN FUNCTION
+# =============================================================================
+
+main() {
+    clear
+
+    cat << 'HEADER'
+
+  ╔═══════════════════════════════════════════════════════════════════╗
+  ║                                                                   ║
+  ║   ClaudeGo - Use Claude Code On The Go                            ║
+  ║                                                                   ║
+  ║   E2E setup for reliable mobile Claude Code sessions              ║
+  ║   No more lost sessions. No more OOM kills.                       ║
+  ║                                                                   ║
+  ╚═══════════════════════════════════════════════════════════════════╝
+
+HEADER
+
+    echo -e "  Version: ${BOLD}$CLAUDEGO_VERSION${NC}"
+    echo
+
+    # Initialize
+    check_root
+    check_sudo
+    init_state
+
+    # Show resume info if applicable
+    load_state
+    if [[ -n "${INSTALL_STARTED:-}" && "${INSTALL_COMPLETED:-}" == "" ]]; then
+        show_resume_info
+        show_menu
+    elif [[ -n "${INSTALL_COMPLETED:-}" ]]; then
+        print_success "Installation was completed on: $INSTALL_COMPLETED"
+        show_menu
+    fi
+
+    # Mark start
+    save_state "INSTALL_STARTED" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Run steps
+    step_system_check
+    step_swap_setup
+    step_packages_install
+    step_node_install
+    step_mosh_setup
+    step_firewall_setup
+    step_tmux_config
+    step_claude_install
+    step_aliases_setup
+    step_validation
+
+    # Authentication
+    run_authentication
+
+    # Done!
+    show_completion
+}
+
+# Run main function
+main "$@"
